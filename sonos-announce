@@ -24,6 +24,7 @@ import functools
 import json
 import http.server
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -33,7 +34,7 @@ import threading
 import time
 import urllib.parse
 import wave
-from concurrent.futures import ThreadPoolExecutor
+
 
 import soco
 from soco.snapshot import Snapshot
@@ -75,12 +76,45 @@ def save_config(cfg):
         f.write("\n")
 
 
+class Tty:
+    """The controlling terminal, for prompts even when stdin is a pipe.
+
+    Opened as separate read and write handles: open("/dev/tty", "r+") fails
+    on macOS because a terminal isn't seekable."""
+
+    def __init__(self):
+        self._in = open("/dev/tty")
+        try:
+            self._out = open("/dev/tty", "w")
+        except OSError:
+            self._in.close()
+            raise
+
+    def write(self, s):
+        self._out.write(s)
+
+    def flush(self):
+        self._out.flush()
+
+    def readline(self):
+        return self._in.readline()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._in.close()
+        self._out.close()
+
+
 def open_tty():
-    """Terminal for prompts, even when the message comes through a pipe."""
     try:
-        return open("/dev/tty", "r+")
-    except OSError:
+        return Tty()
+    except OSError:  # no controlling terminal (cron, launchd, ...)
         return None
+
+
+NO_TTY_HELP = "pass -r ROOM (or --all), or run --setup in a terminal to save a default"
 
 
 def ask(tty, question):
@@ -112,19 +146,19 @@ def pick_rooms(tty, speakers):
 
 def run_setup(tty, speakers):
     tty.write(
-        "\nWhere should announcements play by default?\n"
-        "  1) All rooms\n"
-        "  2) Selected rooms\n"
-        "  3) Ask me every time\n"
+        "\nWhere should announcements play?\n"
+        "  1) Ask me every time\n"
+        "  2) Always the same rooms (choose them now)\n"
+        "  3) All rooms\n"
     )
     while True:
         choice = ask(tty, "Choice [1-3]: ")
         if choice in ("1", "2", "3"):
             break
     if choice == "1":
-        cfg = {"mode": "all"}
-    elif choice == "3":
         cfg = {"mode": "ask"}
+    elif choice == "3":
+        cfg = {"mode": "all"}
     else:
         rooms = pick_rooms(tty, speakers)
         cfg = {"mode": "all"} if rooms is None else {"mode": "rooms", "rooms": rooms}
@@ -134,25 +168,30 @@ def run_setup(tty, speakers):
 
 
 def choose_rooms(speakers):
-    """Rooms from config (running first-time setup if needed). None means all."""
+    """Rooms from config (running first-time setup if needed). None means all.
+
+    Never falls back to all rooms on its own: that happens only when the
+    user picked it (in setup or at the prompt)."""
     if len(speakers) == 1:
         return None
     cfg = load_config()
     if cfg is None:
         tty = open_tty()
         if not tty:
-            return None  # non-interactive first run: keep old behaviour (all rooms)
+            die(f"found {len(speakers)} rooms and no saved choice; {NO_TTY_HELP}")
         with tty:
             cfg = run_setup(tty, speakers)
     if cfg["mode"] == "rooms":
-        return cfg.get("rooms") or None
+        if not cfg.get("rooms"):
+            die(f"no rooms saved in {CONFIG_PATH}; run --setup")
+        return cfg["rooms"]
     if cfg["mode"] == "ask":
         tty = open_tty()
         if not tty:
-            die(f"{CONFIG_PATH} says to ask, but there's no terminal; pass -r ROOM or --all")
+            die(f"can't ask which room without a terminal; {NO_TTY_HELP}")
         with tty:
             return pick_rooms(tty, speakers)
-    return None
+    return None  # mode "all", chosen explicitly
 
 
 def find_speaker(speakers, name):
@@ -209,19 +248,73 @@ def local_ip_for(target_ip):
         return s.getsockname()[0]
 
 
-class QuietHandler(http.server.SimpleHTTPRequestHandler):
+class AudioHandler(http.server.SimpleHTTPRequestHandler):
+    """Static file handler that speaks HTTP Range (Sonos fetches audio in
+    byte ranges and often drops the first connection) and stays quiet."""
+
     def log_message(self, *args):
         pass
 
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # speaker hung up early; it will re-request what it needs
+
+    def end_headers(self):
+        self.send_header("Accept-Ranges", "bytes")
+        super().end_headers()
+
+    def send_head(self):
+        self._remaining = None
+        rng = self.headers.get("Range", "")
+        m = re.fullmatch(r"\s*bytes=(\d*)-(\d*)\s*", rng)
+        path = self.translate_path(self.path)
+        if not m or not os.path.isfile(path) or not any(m.groups()):
+            return super().send_head()
+
+        size = os.path.getsize(path)
+        first, last = m.groups()
+        if first == "":  # suffix range: last N bytes
+            start, end = max(0, size - int(last)), size - 1
+        else:
+            start, end = int(first), min(int(last) if last else size - 1, size - 1)
+        if start >= size or start > end:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return None
+
+        f = open(path, "rb")
+        f.seek(start)
+        self.send_response(206)
+        self.send_header("Content-Type", self.guess_type(path))
+        self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Content-Length", str(end - start + 1))
+        self.end_headers()
+        self._remaining = end - start + 1
+        return f
+
+    def copyfile(self, source, outputfile):
+        if self._remaining is None:
+            return super().copyfile(source, outputfile)
+        while self._remaining > 0:
+            buf = source.read(min(64 * 1024, self._remaining))
+            if not buf:
+                break
+            outputfile.write(buf)
+            self._remaining -= len(buf)
+
 
 def start_server(directory):
-    handler = functools.partial(QuietHandler, directory=directory)
+    handler = functools.partial(AudioHandler, directory=directory)
     server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
 
-def announce_group(coord, uri, volume, duration, title):
+def announce_group(coord, uri, volume, duration, title, stop):
     members = list(coord.group.members) if coord.group else [coord]
     snap = Snapshot(coord)
     snap.snapshot()
@@ -229,6 +322,8 @@ def announce_group(coord, uri, volume, duration, title):
 
     was_playing = snap.transport_state == "PLAYING"
     try:
+        if stop.is_set():
+            return
         if was_playing:
             coord.pause()
         if volume is not None:
@@ -237,13 +332,16 @@ def announce_group(coord, uri, volume, duration, title):
         coord.play_uri(uri, title=title)
 
         # Wait for playback to finish: expected length + slack, polling state.
+        # `stop` (set on Ctrl-C) cuts the wait short; restore still runs.
         deadline = time.time() + (duration or 30) + 10
-        time.sleep(1.5)
+        if stop.wait(1.5):
+            return
         while time.time() < deadline:
             state = coord.get_current_transport_info()["current_transport_state"]
             if state in ("STOPPED", "PAUSED_PLAYBACK"):
                 break
-            time.sleep(0.5)
+            if stop.wait(0.5):
+                return
     finally:
         try:
             coord.stop()
@@ -345,23 +443,50 @@ def main():
             host = local_ip_for(targets[0].ip_address)
             uri = f"http://{host}:{port}/{urllib.parse.quote(name)}"
 
-            with ThreadPoolExecutor(max_workers=len(targets)) as pool:
-                futures = {
-                    pool.submit(announce_group, c, uri, args.volume, duration, title): c
-                    for c in targets
-                }
-                failed = False
-                for f, c in futures.items():
-                    try:
-                        f.result()
-                    except Exception as e:
-                        failed = True
-                        print(f"sonos-announce: {c.player_name}: {e}", file=sys.stderr)
+            names = ", ".join(
+                " + ".join(m.player_name for m in (c.group.members if c.group else [c]))
+                for c in targets)
+            status(f"Announcing in {names}...")
+
+            stop = threading.Event()
+            errors = {}
+
+            def worker(c):
+                try:
+                    announce_group(c, uri, args.volume, duration, title, stop)
+                except Exception as e:
+                    errors[c.player_name] = e
+
+            # Daemon threads, so a second Ctrl-C can always exit immediately.
+            threads = [threading.Thread(target=worker, args=(c,), daemon=True) for c in targets]
+            for t in threads:
+                t.start()
+            interrupted = False
+            try:
+                while any(t.is_alive() for t in threads):
+                    for t in threads:
+                        t.join(0.2)
+            except KeyboardInterrupt:
+                interrupted = True
+                stop.set()
+                status("\nStopping and restoring speakers (Ctrl-C again to force quit)...")
+                for t in threads:
+                    t.join()
         finally:
             server.shutdown()
 
-    if failed:
+    for name, e in errors.items():
+        print(f"sonos-announce: {name}: {e}", file=sys.stderr)
+    if interrupted:
+        sys.exit(130)
+    if errors:
         sys.exit(1)
+    status("Done.")
+
+
+def status(msg):
+    if sys.stderr.isatty():
+        print(msg, file=sys.stderr)
 
 
 if __name__ == "__main__":
