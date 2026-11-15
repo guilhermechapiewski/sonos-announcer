@@ -32,14 +32,34 @@ was playing before comes back: same track, same position, same volume.
 
 ## Installation
 
+With one command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/guilhermechapiewski/sonos-announcer/main/install.sh | sh
+```
+
+Or from a clone:
+
 ```sh
 git clone https://github.com/guilhermechapiewski/sonos-announcer.git
 cd sonos-announcer
-ln -s "$PWD/sonos-announce" /usr/local/bin/sonos-announce   # or any directory in your PATH
+./install.sh            # add --link to symlink instead, so `git pull` updates it
 ```
 
-The first run downloads its one dependency, [SoCo](https://github.com/SoCo/SoCo),
-into uv's cache. That takes a few seconds.
+The installer puts `sonos-announce` in a folder that's already on your `PATH`
+(`/opt/homebrew/bin`, `/usr/local/bin` or `~/.local/bin`, whichever is writable
+without `sudo`), so it works from any directory. If none of them is on your
+`PATH`, it uses `~/.local/bin` and shows you the line to add to your shell
+profile. Use `--dir DIR` to choose the folder yourself.
+
+It also downloads the one dependency, [SoCo](https://github.com/SoCo/SoCo), so
+the first announcement starts quickly.
+
+To uninstall:
+
+```sh
+./install.sh --uninstall           # add --purge to also delete ~/.sonos-announce
+```
 
 > **macOS firewall:** the speakers download the audio from your computer. If
 > the firewall is on, allow incoming connections for Python when macOS asks,
@@ -74,17 +94,25 @@ to what they were playing. Press it again to quit immediately.
 
 ## Choosing rooms
 
-If you have more than one speaker, the first run asks:
+If you have more than one speaker, the first run lists them and asks:
 
 ```
 Where should announcements play?
-  1) Ask me every time
-  2) Always the same rooms (choose them now)
-  3) All rooms
+
+   1) Kitchen  (grouped with Living Room)
+   2) Living Room  (grouped with Kitchen)
+   3) Office
+
+   a) All rooms
+   e) Ask me every time
+
+Choose room numbers (e.g. 1 or 1,3), 'a' for all, 'e' to ask every time:
 ```
 
-Your answer goes into `~/.sonos-announce` (a small JSON file). Run
-`sonos-announce --setup` to change it.
+Pick one or more rooms to always use, `a` for all rooms, or `e` to see this
+list (without the `e` option) before every announcement. Your answer goes into
+`~/.sonos-announce` (a small JSON file). Run `sonos-announce --setup` to change
+it.
 
 Rooms given on the command line always take priority. The order is:
 
