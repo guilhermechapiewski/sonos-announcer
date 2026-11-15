@@ -1,4 +1,4 @@
-# sonos-announce
+# sonos-announcer
 
 Make announcements on your Sonos speakers from the command line.
 
