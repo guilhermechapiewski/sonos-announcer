@@ -11,8 +11,8 @@ before is restored (track, position, volume).
 
 Examples:
   sonos-announce "Dinner is ready"
-  sonos-announce -r Kitchen -r "Living Room" -v 40 "Leaving in 5 minutes"
-  sonos-announce --all --voice Samantha "Good night"
+  sonos-announce -r kitchen,"living room" -v 40 "Leaving in 5 minutes"
+  sonos-announce --all -V Samantha "Good night"
   echo "Build finished" | sonos-announce -r Office
   sonos-announce --sound ~/chime.mp3 -r Office
   sonos-announce --list
@@ -155,19 +155,31 @@ def choose_rooms(speakers):
     return None
 
 
+def find_speaker(speakers, name):
+    """Match a room forgivingly: exact name, then prefix, then substring
+    (case-insensitive), so `garage` finds "Garage Sonos"."""
+    want = name.strip().lower()
+    names = [(s.player_name.lower(), s) for s in speakers]
+    def short(n):  # "garage sonos" -> "garage"
+        return n[: -len(" sonos")] if n.endswith(" sonos") else n
+
+    for match in (lambda n: n == want, lambda n: short(n) == short(want),
+                  lambda n: n.startswith(want), lambda n: want in n):
+        hits = [s for n, s in names if match(n)]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            die(f"room '{name}' is ambiguous: " + ", ".join(s.player_name for s in hits))
+    available = ", ".join(s.player_name for s in speakers)
+    die(f"unknown room '{name}'. Available: {available} (saved rooms can be changed with --setup)")
+
+
 def resolve_targets(speakers, rooms, all_rooms):
     """Return the group coordinators to play on (one per affected group)."""
     if all_rooms or not rooms:
         chosen = speakers
     else:
-        by_name = {s.player_name.lower(): s for s in speakers}
-        chosen = []
-        for r in rooms:
-            s = by_name.get(r.lower())
-            if not s:
-                names = ", ".join(s.player_name for s in speakers)
-                die(f"unknown room '{r}'. Available: {names} (saved rooms can be changed with --setup)")
-            chosen.append(s)
+        chosen = [find_speaker(speakers, r) for r in rooms]
 
     coords = {}
     for s in chosen:
@@ -261,19 +273,23 @@ def main():
         epilog="Examples:" + __doc__.split("Examples:", 1)[1],
     )
     p.add_argument("message", nargs="*", help="text to speak (reads stdin if omitted)")
-    p.add_argument("-r", "--room", action="append", default=[],
-                   help="room to announce in (repeatable; default: all, or $%s)" % CONFIG_ENV_ROOM)
+    p.add_argument("-r", "--room", "--rooms", dest="room", action="append", default=[],
+                   metavar="ROOM",
+                   help="room(s) to announce in; repeat or comma-separate, partial names "
+                        "OK (e.g. -r garage,family). Default: saved choice from --setup")
     p.add_argument("-a", "--all", action="store_true", help="announce in every room")
-    p.add_argument("-v", "--volume", type=int,
+    p.add_argument("-v", "--volume", "--vol", dest="volume", type=int, metavar="0-100",
                    default=int(os.environ[CONFIG_ENV_VOLUME]) if os.environ.get(CONFIG_ENV_VOLUME) else None,
-                   help="announcement volume 0-100 (default: keep current)")
-    p.add_argument("--voice", default=os.environ.get(CONFIG_ENV_VOICE),
-                   help="macOS voice (see `say -v '?'`)")
-    p.add_argument("-s", "--sound", help="play an audio file (mp3/wav/...) instead of speech")
+                   help="announcement volume (default: keep current)")
+    p.add_argument("-V", "--voice", default=os.environ.get(CONFIG_ENV_VOICE),
+                   help="macOS voice, e.g. Samantha (list them with: say -v '?')")
+    p.add_argument("-s", "--sound", "-f", "--file", dest="sound", metavar="FILE",
+                   help="play an audio file (mp3/wav/...) instead of speech")
     p.add_argument("-l", "--list", action="store_true", help="list speakers and exit")
-    p.add_argument("--setup", action="store_true",
-                   help=f"choose default rooms (saved in {CONFIG_PATH})")
+    p.add_argument("-c", "--setup", "--config", dest="setup", action="store_true",
+                   help=f"choose default rooms again (saved in {CONFIG_PATH})")
     args = p.parse_args()
+    args.room = [r.strip() for arg in args.room for r in arg.split(",") if r.strip()]
 
     if args.list:
         cmd_list()
