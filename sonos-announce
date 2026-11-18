@@ -208,14 +208,11 @@ def choose_rooms(speakers):
 
 def find_speaker(speakers, name):
     """Match a room forgivingly: exact name, then prefix, then substring
-    (case-insensitive), so `garage` finds "Garage Sonos"."""
+    (case-insensitive), so `living` finds "Living Room"."""
     want = name.strip().lower()
     names = [(s.player_name.lower(), s) for s in speakers]
-    def short(n):  # "garage sonos" -> "garage"
-        return n[: -len(" sonos")] if n.endswith(" sonos") else n
 
-    for match in (lambda n: n == want, lambda n: short(n) == short(want),
-                  lambda n: n.startswith(want), lambda n: want in n):
+    for match in (lambda n: n == want, lambda n: n.startswith(want), lambda n: want in n):
         hits = [s for n, s in names if match(n)]
         if len(hits) == 1:
             return hits[0]
@@ -386,7 +383,7 @@ def main():
     p.add_argument("-r", "--room", "--rooms", dest="room", action="append", default=[],
                    metavar="ROOM",
                    help="room(s) to announce in; repeat or comma-separate, partial names "
-                        "OK (e.g. -r garage,family). Default: saved choice from --setup")
+                        "OK (e.g. -r kitchen,living). Default: saved choice from --setup")
     p.add_argument("-a", "--all", action="store_true", help="announce in every room")
     p.add_argument("-v", "--volume", "--vol", dest="volume", type=int, metavar="0-100",
                    default=int(os.environ[CONFIG_ENV_VOLUME]) if os.environ.get(CONFIG_ENV_VOLUME) else None,
